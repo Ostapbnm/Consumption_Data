@@ -1,0 +1,68 @@
+name: Consumption Forecast
+
+on:
+  # Ручний запуск з вкладки Actions - прогноз на тому, що вже є в data/*.db
+  workflow_dispatch: {}
+
+  # Remote ПК викликає GitHub API:
+  #   POST /repos/{owner}/{repo}/dispatches
+  #   { "event_type": "new-consumption-data", "client_payload": { "rows": [...] } }
+  # див. scripts/ingest_dispatch_payload.py - там і формат payload, і застереження,
+  # що це тимчасова заглушка, доки формат остаточно не узгоджено.
+  repository_dispatch:
+    types: [new-consumption-data]
+
+  # Розкоментуйте, якщо хочете додатковий запуск за розкладом незалежно від
+  # дисптачів (наприклад, щогодини о 5-й хвилині):
+  # schedule:
+  #   - cron: '5 * * * *'
+
+# Черга замість паралельних запусків - два одночасні запуски намагатимуться
+# закомітити той самий data/forecasts.db і зіштовхнуться конфліктом git push.
+concurrency:
+  group: consumption-forecast
+  cancel-in-progress: false
+
+# Потрібно contents:write, щоб крок нижче міг закомітити оновлені файли
+# назад у репозиторій через стандартний GITHUB_TOKEN (без окремого PAT).
+permissions:
+  contents: write
+
+jobs:
+  forecast:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Ingest new rows from repository_dispatch payload (if present)
+        if: github.event_name == 'repository_dispatch'
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: python scripts/ingest_dispatch_payload.py
+
+      - name: Run forecast
+        run: python consumption_forecast.py
+
+      - name: Commit and push updated data files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/*.db
+          if git diff --cached --quiet; then
+            echo "Немає змін для коміту."
+          else
+            git commit -m "Автооновлення прогнозу споживання"
+            git pull --rebase origin "${{ github.ref_name }}"
+            git push
+          fi
