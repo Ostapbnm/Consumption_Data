@@ -16,8 +16,14 @@ actuals_consumption).
   механізм доставки/формат джерела;
 - погода: історична фактична - Open-Meteo Archive API (для навчання),
   прогнозна - Open-Meteo Forecast API з past_days (для майбутніх годин і
-  для "мосту" в останні 1-3 дні, куди Archive API ще не встиг дотягнутися -
-  у нього є затримка);
+  для "мосту" в останні дні, куди Archive API ще не встиг дотягнутися -
+  у нього є затримка ~5-6 днів);
+- дані споживання живуть у фіксованій (без DST) таймзоні DATA_TIMEZONE =
+  'Etc/GMT-2' - перевірено на реальних даних, що лічильник не переходить
+  на літній/зимовий час (є окремі рядки і на 03:00, і на 04:00 в день
+  переходу). Погода запитується в цивільній TIMEZONE (Open-Meteo іншої не
+  розуміє), але одразу конвертується в DATA_TIMEZONE - інакше reindex/join
+  між споживанням і погодою під час DST-переходів падає на дублікатах;
 - усі HTTP-запити - з ретраями, весь main() - з try/except і
   sys.exit(1) при фатальній помилці, щоб GitHub Actions чітко бачив
   падіння запуску в статусі workflow, а не мовчки "зелений" крок з
@@ -53,7 +59,17 @@ DB_PATH = os.environ.get('FORECAST_DB_PATH', 'data/forecasts.db')
 
 LATITUDE = float(os.environ.get('SITE_LATITUDE', '48.8475'))
 LONGITUDE = float(os.environ.get('SITE_LONGITUDE', '24.6894'))
+# Цивільний час - для запитів до Open-Meteo (він очікує IANA-таймзону з
+# переходами на літній/зимовий час, як і будь-яка погодна станція).
 TIMEZONE = 'Europe/Kyiv'
+# А ось дані споживання - НЕ цивільний час: перевірено на реальних даних,
+# що 29.03.2026 (день переходу на літній час) в лічильнику є і 03:00, і
+# 04:00 - тобто пристрій веде облік фіксованим зсувом UTC+2 і DST не
+# застосовує. Якщо localізувати цей індекс у Europe/Kyiv, нібито-неіснуюча
+# 03:00 навесні "зсувається" в 04:00, де вже є реальний рядок - і
+# reindex() падає на дублікаті. Тому для споживання - окрема, фіксована
+# (без DST) таймзона; для погоди - лишається цивільна.
+DATA_TIMEZONE = 'Etc/GMT-2'  # УВАГА: назва інвертована по POSIX-угоді, це і є UTC+2
 OPEN_METEO_MODELS = ['icon_seamless', 'gfs_seamless', 'ecmwf_ifs025']
 
 FORECAST_HOURS = 36
@@ -61,8 +77,10 @@ FORECAST_HOURS = 36
 # навіть якщо той почався не рівно "зараз" (дані споживання можуть відставати).
 WEATHER_FORECAST_BUFFER_HOURS = FORECAST_HOURS + 12
 # На скільки днів "углиб" тягнути Forecast API (past_days), щоб перекрити
-# затримку Archive API (Archive зазвичай відстає на 1-2 дні).
-WEATHER_PAST_DAYS_BRIDGE = 3
+# затримку Archive API. На практиці затримка Archive API ближче до 5-6 днів
+# (не 1-2, як спершу закладалось) - 3 дні лишали ~63-годинну дірку в перших
+# тестових прогонах. 7 - з запасом.
+WEATHER_PAST_DAYS_BRIDGE = 7
 
 # Лаги, безпечні для будь-якого горизонту в межах FORECAST_HOURS (36 год):
 # lag_24h навмисно не використовується - для годин 25-36 наперед його ще
@@ -98,15 +116,18 @@ def _http_get_json(url, params, retries=HTTP_RETRIES, backoff=HTTP_BACKOFF_SECON
     raise last_exc
 
 
-def _localize_to_tz(index):
-    """tz-naive -> tz-aware TIMEZONE. Без цього пошук лагів/погоди для
-    майбутніх годин мовчки провалиться через конфлікт naive/aware timestamps."""
+def _localize_to_tz(index, tz):
+    """tz-naive -> tz-aware. Без цього пошук лагів/погоди для майбутніх годин
+    мовчки провалиться через конфлікт naive/aware timestamps. Фіксовані
+    зсуви (як DATA_TIMEZONE) ніколи не мають неіснуючих/неоднозначних
+    годин, тому nonexistent/ambiguous реально спрацьовують лише для
+    цивільної TIMEZONE (погода)."""
     if index.tz is not None:
         return index
     try:
-        return index.tz_localize(TIMEZONE, nonexistent='shift_forward', ambiguous='infer')
+        return index.tz_localize(tz, nonexistent='shift_forward', ambiguous='infer')
     except Exception:
-        localized = index.tz_localize(TIMEZONE, nonexistent='shift_forward', ambiguous='NaT')
+        localized = index.tz_localize(tz, nonexistent='shift_forward', ambiguous='NaT')
         return localized[~localized.isna()]
 
 
@@ -120,12 +141,12 @@ def load_historical_data():
             "SELECT hour_start, consumption_kw, n_readings FROM hourly_consumption", conn
         )
 
-    df['Дата'] = pd.to_datetime(df['hour_start'])
+    df['Дата'] = pd.to_datetime(df['hour_start'], dayfirst=True)
     df = df.rename(columns={'consumption_kw': 'Споживання'})
     df = df.sort_values('Дата').set_index('Дата')
-    df.index = _localize_to_tz(df.index)
+    df.index = _localize_to_tz(df.index, DATA_TIMEZONE)
 
-    full_range = pd.date_range(df.index.min(), df.index.max(), freq='h', tz=TIMEZONE)
+    full_range = pd.date_range(df.index.min(), df.index.max(), freq='h', tz=DATA_TIMEZONE)
     missing = full_range.difference(df.index)
     if len(missing) > 0:
         print(f"⚠️ У джерелі бракує {len(missing)} годин (повністю відсутні рядки) "
@@ -163,7 +184,10 @@ def fetch_historical_weather(start, end):
     hourly = data['hourly']
     idx = pd.to_datetime(hourly['time'])
     temp = pd.Series(hourly['temperature_2m'], index=idx, name='Температура_C')
-    temp.index = _localize_to_tz(temp.index)
+    # Open-Meteo повертає час у цивільній TIMEZONE (з DST) - конвертуємо в
+    # DATA_TIMEZONE (фіксований UTC+2), бо саме в ній живе індекс споживання,
+    # і всі подальші join/reindex мають звірятись по одній сітці годин.
+    temp.index = _localize_to_tz(temp.index, TIMEZONE).tz_convert(DATA_TIMEZONE)
     return temp
 
 
@@ -199,7 +223,9 @@ def fetch_temperature_forecast(past_days=WEATHER_PAST_DAYS_BRIDGE,
 
     temp_series = pd.concat(temp_cols, axis=1).mean(axis=1, skipna=True)
     temp_series.name = 'Температура_C'
-    temp_series.index = _localize_to_tz(temp_series.index)
+    # Та сама причина, що й у fetch_historical_weather - переводимо з
+    # цивільної TIMEZONE у фіксовану DATA_TIMEZONE перед будь-яким reindex.
+    temp_series.index = _localize_to_tz(temp_series.index, TIMEZONE).tz_convert(DATA_TIMEZONE)
     return temp_series
 
 
@@ -299,7 +325,7 @@ def build_future_index(last_known_time):
     """FORECAST_HOURS год наперед від наступної повної години після останніх
     відомих даних споживання."""
     start = (last_known_time + pd.Timedelta(hours=1)).floor('h')
-    return pd.date_range(start=start, periods=FORECAST_HOURS, freq='h', tz=TIMEZONE)
+    return pd.date_range(start=start, periods=FORECAST_HOURS, freq='h', tz=DATA_TIMEZONE)
 
 
 def build_future_features(df_hist, future_index, weather_series, ukr_holidays):
