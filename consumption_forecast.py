@@ -92,6 +92,15 @@ MODEL_VERSION = 'lightgbm_v2_weather'
 
 LOW_READING_THRESHOLD = 30  # менше цієї к-сті зчитувань в годині - вважаємо ненадійним
 
+# Наскільки "застарілими" можуть бути дані споживання, перш ніж це стає
+# проблемою. WARNING - просто голосно попереджає в лозі (Actions), FAIL -
+# зупиняє запуск з помилкою (exit code 1), щоб CI показав явний "провалений"
+# статус замість тихого повторення того самого прогнозу щогодини.
+# Підберіть під реальну частоту доставки даних з remote ПК - якщо там
+# дані приходять раз на годину, поріг варто тримати вужчим.
+DATA_STALENESS_WARNING_HOURS = float(os.environ.get('DATA_STALENESS_WARNING_HOURS', '6'))
+DATA_STALENESS_FAIL_HOURS = float(os.environ.get('DATA_STALENESS_FAIL_HOURS', '48'))
+
 HTTP_RETRIES = 3
 HTTP_BACKOFF_SECONDS = 5
 
@@ -321,10 +330,14 @@ def train_model(df_features):
 # ==============================================================================
 # 8. 🔮 ПОБУДОВА ОЗНАК ДЛЯ МАЙБУТНІХ ГОДИН
 # ==============================================================================
-def build_future_index(last_known_time):
-    """FORECAST_HOURS год наперед від наступної повної години після останніх
-    відомих даних споживання."""
-    start = (last_known_time + pd.Timedelta(hours=1)).floor('h')
+def build_future_index(reference_time):
+    """FORECAST_HOURS год наперед від наступної повної години після
+    reference_time. Навмисно НЕ прив'язано до останньої точки в df_hist -
+    reference_time має бути реальний поточний час (див. main()), інакше
+    при застарілих даних (збій доставки з remote ПК) прогноз мовчки
+    "втікає" в минуле відносно реального "зараз", замість передбачення
+    на актуальний час з fallback-значеннями там, де свіжих даних бракує."""
+    start = (reference_time + pd.Timedelta(hours=1)).floor('h')
     return pd.date_range(start=start, periods=FORECAST_HOURS, freq='h', tz=DATA_TIMEZONE)
 
 
@@ -440,6 +453,20 @@ def main():
     print("📂 Завантажуємо історичні дані з SQL...")
     df_hist = load_historical_data()
 
+    now = pd.Timestamp.now(tz=DATA_TIMEZONE)
+    data_age_hours = (now - df_hist.index.max()).total_seconds() / 3600
+    if data_age_hours > DATA_STALENESS_FAIL_HOURS:
+        raise RuntimeError(
+            f"Дані застаріли на {data_age_hours:.1f} год (поріг: {DATA_STALENESS_FAIL_HOURS} год). "
+            f"Останній рядок у джерелі: {df_hist.index.max()}, зараз: {now}. "
+            f"Схоже, доставка даних з remote ПК не працює - зупиняю запуск, "
+            f"щоб не публікувати прогноз, побудований на явно неактуальних даних."
+        )
+    elif data_age_hours > DATA_STALENESS_WARNING_HOURS:
+        print(f"⚠️ Дані застаріли на {data_age_hours:.1f} год (останній рядок: {df_hist.index.max()}). "
+              f"Прогноз все одно рахується від реального поточного часу - лаги там, де свіжих "
+              f"даних бракує, підстрахує fallback-медіана по годині доби, але точність нижче звичної.")
+
     years = range(df_hist.index.year.min(), df_hist.index.year.max() + 2)
     ukr_holidays = holidays.Ukraine(years=years)
 
@@ -455,7 +482,7 @@ def main():
     df_features = engineer_features(df_hist, ukr_holidays)
     model = train_model(df_features)
 
-    future_index = build_future_index(df_hist.index.max())
+    future_index = build_future_index(now)
     future_features = build_future_features(df_hist, future_index, weather_series, ukr_holidays)
 
     for lag in LAG_HOURS:
