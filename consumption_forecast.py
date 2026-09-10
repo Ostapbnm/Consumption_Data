@@ -54,7 +54,7 @@ import holidays
 # у GitHub Actions checkout), або перевизначаються env-змінними, якщо
 # файли лежать деінде. Локально можна так само задати ці env-змінні,
 # або просто тримати data/ поруч зі скриптом.
-SQL_SOURCE_PATH = os.environ.get('SQL_SOURCE_PATH', 'data/hourly_consumption.db')
+SQL_SOURCE_PATH = os.environ.get('SQL_SOURCE_PATH', 'data/hourly_consumption1.db')
 DB_PATH = os.environ.get('FORECAST_DB_PATH', 'data/forecasts.db')
 
 LATITUDE = float(os.environ.get('SITE_LATITUDE', '48.8475'))
